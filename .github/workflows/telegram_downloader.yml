@@ -1,4 +1,4 @@
-name: تلگرام دانلودر (حذف موازی قبل از checkout)
+name: تلگرام دانلودر (حذف اتمی قبل از checkout)
 
 on:
   workflow_dispatch:
@@ -39,55 +39,80 @@ jobs:
 
     steps:
       # ──────────────────────────────────────
-      # قدم اول: حذف فایل‌های قدیمی روی سرور گیتهاب (موازی)
+      # قدم اول: حذف کل پوشهٔ downloads با یک commit اتمی (API)
       # ──────────────────────────────────────
-      - name: 🗑️ حذف محتوای downloads روی سرور (موازی)
+      - name: 🗑️ حذف پوشهٔ downloads با commit اتمی (بدون checkout)
         if: github.event.inputs.clean_previous == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
           BRANCH: ${{ github.ref_name }}
         run: |
-          API="https://api.github.com/repos/${REPO}/contents/downloads?ref=${BRANCH}"
-          echo "📡 دریافت لیست فایل‌های موجود در downloads..."
-          FILES=$(curl -s -H "Authorization: Bearer ${GH_TOKEN}" \
-                       -H "Accept: application/vnd.github+json" \
-                       "$API")
+          set -e
+          API="https://api.github.com/repos/${REPO}"
+          AUTH="Authorization: Bearer ${GH_TOKEN}"
+          ACCEPT="Accept: application/vnd.github+json"
 
-          if echo "$FILES" | grep -q "Not Found"; then
-            echo "📂 پوشهٔ downloads وجود ندارد – چیزی برای حذف نیست."
+          echo "📡 دریافت آخرین commit شاخهٔ ${BRANCH}..."
+          REF=$(curl -s -H "$AUTH" -H "$ACCEPT" "${API}/git/ref/heads/${BRANCH}")
+          COMMIT_SHA=$(echo "$REF" | jq -r '.object.sha')
+          if [ -z "$COMMIT_SHA" ] || [ "$COMMIT_SHA" = "null" ]; then
+            echo "❌ شاخه یافت نشد."
+            exit 1
+          fi
+          echo "   ✅ آخرین commit: ${COMMIT_SHA}"
+
+          echo "📡 دریافت درخت فعلی..."
+          COMMIT_DATA=$(curl -s -H "$AUTH" -H "$ACCEPT" "${API}/git/commits/${COMMIT_SHA}")
+          TREE_SHA=$(echo "$COMMIT_DATA" | jq -r '.tree.sha')
+          echo "   ✅ SHA درخت: ${TREE_SHA}"
+
+          echo "📡 دریافت کل درخت (recursive)..."
+          TREE_DATA=$(curl -s -H "$AUTH" -H "$ACCEPT" "${API}/git/trees/${TREE_SHA}?recursive=1")
+          # درخت ممکن است بزرگ باشد ولی معمولاً کمتر از ۱۰۰۰ فایل
+          ALL_ENTRIES=$(echo "$TREE_DATA" | jq '.tree')
+          if [ "$ALL_ENTRIES" = "null" ]; then
+            echo "⚠️ درخت خالی است. پوشه‌ای برای حذف وجود ندارد."
             exit 0
           fi
 
-          COUNT=$(echo "$FILES" | jq '. | length')
-          if [ "$COUNT" -eq 0 ]; then
-            echo "📂 پوشهٔ downloads خالی است."
-            exit 0
+          echo "🔍 حذف تمام مسیرهایی که با 'downloads/' شروع می‌شوند..."
+          NEW_TREE=$(echo "$ALL_ENTRIES" | jq '[.[] | select(.path | startswith("downloads/") | not)] | {tree: .}' | \
+                     curl -s -X POST -H "$AUTH" -H "$ACCEPT" -d @- "${API}/git/trees")
+          NEW_TREE_SHA=$(echo "$NEW_TREE" | jq -r '.sha')
+          if [ -z "$NEW_TREE_SHA" ] || [ "$NEW_TREE_SHA" = "null" ]; then
+            echo "❌ ساخت درخت جدید شکست خورد:"
+            echo "$NEW_TREE"
+            exit 1
           fi
+          echo "   ✅ درخت جدید: ${NEW_TREE_SHA}"
 
-          echo "🔍 $COUNT فایل پیدا شد – حذف موازی با دسته‌های ۱۰ تایی..."
+          echo "📝 ایجاد commit جدید..."
+          NEW_COMMIT=$(curl -s -X POST -H "$AUTH" -H "$ACCEPT" \
+            "${API}/git/commits" \
+            -d "{\"message\":\"پاک‌سازی downloads پیش از دانلود\",\"tree\":\"${NEW_TREE_SHA}\",\"parents\":[\"${COMMIT_SHA}\"]}")
+          NEW_COMMIT_SHA=$(echo "$NEW_COMMIT" | jq -r '.sha')
+          if [ -z "$NEW_COMMIT_SHA" ] || [ "$NEW_COMMIT_SHA" = "null" ]; then
+            echo "❌ ایجاد commit شکست خورد:"
+            echo "$NEW_COMMIT"
+            exit 1
+          fi
+          echo "   ✅ commit جدید: ${NEW_COMMIT_SHA}"
 
-          batch=0
-          while IFS='|' read -r NAME SHA; do
-            (
-              curl -s -X DELETE \
-                -H "Authorization: Bearer ${GH_TOKEN}" \
-                -H "Accept: application/vnd.github+json" \
-                "https://api.github.com/repos/${REPO}/contents/downloads/${NAME}" \
-                -d "{\"message\":\"پاک‌سازی پیش از دانلود\",\"sha\":\"${SHA}\",\"branch\":\"${BRANCH}\"}" > /dev/null \
-                && echo "🗑️ ${NAME} حذف شد" || true
-            ) &
-            ((batch++))
-            if [ $batch -ge 10 ]; then
-              wait || true
-              batch=0
-            fi
-          done < <(echo "$FILES" | jq -r '.[] | "\(.name)|\(.sha)"')
-          wait || true  # برای باقی‌مانده‌ها
-          echo "✅ همهٔ فایل‌های قبلی از سرور حذف شدند."
+          echo "🔄 به‌روزرسانی شاخهٔ ${BRANCH}..."
+          UPDATE=$(curl -s -X PATCH -H "$AUTH" -H "$ACCEPT" \
+            "${API}/git/refs/heads/${BRANCH}" \
+            -d "{\"sha\":\"${NEW_COMMIT_SHA}\",\"force\":false}")
+          if echo "$UPDATE" | jq -e '.ref' > /dev/null; then
+            echo "✅ پوشهٔ downloads با موفقیت حذف شد."
+          else
+            echo "❌ به‌روزرسانی شاخه شکست خورد:"
+            echo "$UPDATE"
+            exit 1
+          fi
 
       # ──────────────────────────────────────
-      # قدم دوم: دریافت شاخه (حالا سبک و سریع)
+      # قدم دوم: دریافت شاخه (حالا سبک)
       # ──────────────────────────────────────
       - name: 📂 دریافت مخزن (فقط آخرین نسخه)
         uses: actions/checkout@v5
@@ -97,7 +122,7 @@ jobs:
           fetch-depth: 1
 
       # ──────────────────────────────────────
-      # بقیه مراحل (مانند قبل)
+      # قدم سوم: نصب ابزارها و کتابخانه‌ها
       # ──────────────────────────────────────
       - name: 🔧 نصب ابزارهای ضروری
         run: |
@@ -107,6 +132,9 @@ jobs:
       - name: 🐍 نصب کتابخانه‌های پایتون
         run: pip3 install requests
 
+      # ──────────────────────────────────────
+      # قدم چهارم: ساخت اسکریپت دانلودر
+      # ──────────────────────────────────────
       - name: 📝 ساخت اسکریپت دانلودر
         run: |
           cat > telegram_downloader.py << 'EOF'
@@ -328,6 +356,9 @@ jobs:
           EOF
           chmod +x telegram_downloader.py
 
+      # ──────────────────────────────────────
+      # قدم پنجم: اجرای دانلودر
+      # ──────────────────────────────────────
       - name: 🚀 اجرای دانلودر
         run: |
           export TEL_LINKS="${{ github.event.inputs.telegram_links }}"
@@ -336,6 +367,9 @@ jobs:
           export CUSTOM_FILENAME="${{ github.event.inputs.custom_filename }}"
           python3 telegram_downloader.py
 
+      # ──────────────────────────────────────
+      # قدم ششم: ارسال فایل‌ها به مخزن
+      # ──────────────────────────────────────
       - name: 📤 ارسال فایل‌های جدید به مخزن
         run: |
           git config user.name "github-actions[bot]"
